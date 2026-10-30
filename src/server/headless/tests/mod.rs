@@ -257,6 +257,7 @@ fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo>
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
     let response: api::schema::SuccessResponse =
         serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
@@ -314,6 +315,7 @@ fn headless_api_request_drains_all_pending_internal_events_before_reading_state(
             },
             respond_to,
             response_write_complete: None,
+            peer_pid: None,
         })
     );
     let response = response_rx
@@ -2118,6 +2120,7 @@ async fn client_local_navigation_does_not_emit_global_focus_transitions() {
             },
             respond_to,
             response_write_complete: None,
+            peer_pid: None,
         },
     );
     server.app.sync_focus_events();
@@ -2208,6 +2211,7 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
                 },
                 respond_to,
                 response_write_complete: None,
+                peer_pid: None,
             },
         );
         let response = response_rx.recv().expect("navigation response");
@@ -2339,6 +2343,7 @@ async fn repeated_layout_action_reapplies_controller_geometry() {
             },
             respond_to,
             response_write_complete: None,
+            peer_pid: None,
         },
     ));
 
@@ -2383,6 +2388,7 @@ async fn public_close_reapplies_controller_geometry() {
             },
             respond_to,
             response_write_complete: None,
+            peer_pid: None,
         })
     );
 
@@ -2586,6 +2592,7 @@ async fn public_background_tab_create_preserves_client_locations() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
 
     assert_eq!(
@@ -2633,6 +2640,7 @@ async fn public_workspace_focus_preserves_each_clients_remembered_tabs() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
 
     let first_location = server.clients[&41].shell_location.as_ref().unwrap();
@@ -2713,6 +2721,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
     let response: crate::api::schema::SuccessResponse =
         serde_json::from_str(&response_rx.recv().expect("agent focus response")).unwrap();
@@ -2788,6 +2797,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
     assert_eq!(server.app.state.active, Some(1));
     server.render_and_stream();
@@ -3405,6 +3415,7 @@ async fn worktree_discovery_does_not_block_client_typing() {
             },
             respond_to,
             response_write_complete: None,
+            peer_pid: None,
         });
         entered
             .recv_timeout(Duration::from_secs(5))
@@ -5025,6 +5036,7 @@ fn windows_shutdown_probe_preserves_panes_and_agent_sessions() {
                     },
                     respond_to,
                     response_write_complete: None,
+                    peer_pid: None,
                 });
                 let response: api::schema::ErrorResponse =
                     serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
@@ -7542,6 +7554,7 @@ fn notification_show_api_forwards_one_semantic_client_notification() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
 
     assert!(changed);
@@ -7604,6 +7617,7 @@ fn notification_show_api_preserves_colon_in_forwarded_title() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
 
     assert!(changed);
@@ -7649,6 +7663,7 @@ fn notification_show_api_validates_empty_title_before_disabled_delivery() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
 
     assert!(changed);
@@ -7679,6 +7694,7 @@ fn notification_show_api_reports_no_foreground_client() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
 
     assert!(changed);
@@ -7729,6 +7745,7 @@ fn notification_show_api_includes_sound_in_semantic_event() {
             },
             respond_to,
             response_write_complete: None,
+            peer_pid: None,
         })
     );
 
@@ -7790,6 +7807,7 @@ fn completion_guard_api_report(server: &mut HeadlessServer, method: api::schema:
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
     let response = response_rx
         .recv_timeout(Duration::from_millis(100))
@@ -7849,6 +7867,7 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
     let response = response_rx
         .recv_timeout(Duration::from_millis(100))
@@ -7881,11 +7900,15 @@ fn api_report_agent_stores_valid_resume_argv_and_rejects_invalid() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
     let response = response_rx
         .recv_timeout(Duration::from_millis(100))
         .unwrap();
-    assert!(response.contains("resume_not_accepted"), "{response}");
+    assert!(
+        response.contains("unauthorized_agent_session"),
+        "{response}"
+    );
     assert_eq!(
         server.app.state.terminals[&terminal_id]
             .reported_resume()
@@ -7921,16 +7944,32 @@ fn api_resume_argv_is_ignored_when_its_session_report_is_refused() {
         })
     };
 
-    completion_guard_api_report(&mut server, report("session-a"));
-    completion_guard_api_report(&mut server, report("session-b"));
+    for (id, session) in [
+        ("missing-peer-a", "session-a"),
+        ("missing-peer-b", "session-b"),
+    ] {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: id.into(),
+                method: report(session),
+            },
+            respond_to,
+            response_write_complete: None,
+            peer_pid: None,
+        });
+        let response = response_rx
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap();
+        assert!(
+            response.contains("unauthenticated_agent_session"),
+            "{response}"
+        );
+    }
 
-    let terminal = &server.app.state.terminals[&terminal_id];
-    assert!(terminal
-        .session_ref_is_current(&crate::agent_resume::AgentSessionRef::id("session-a").unwrap()));
-    assert_eq!(
-        terminal.reported_resume().unwrap().argv,
-        vec!["claude", "--resume", "session-a"]
-    );
+    assert!(server.app.state.terminals[&terminal_id]
+        .reported_resume()
+        .is_none());
 }
 
 fn completion_guard_notifications(
@@ -8264,6 +8303,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
         },
         respond_to,
         response_write_complete: None,
+        peer_pid: None,
     });
 
     assert!(changed);

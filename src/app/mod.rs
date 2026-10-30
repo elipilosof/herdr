@@ -3034,14 +3034,15 @@ mod tests {
         let retry = app.handle_api_request(request());
         let retry: serde_json::Value = serde_json::from_str(&retry).unwrap();
         assert_eq!(retry["result"]["type"], "agent_started");
+        assert!(retry["result"]["agent"]["agent_session"].is_null());
         assert_eq!(
-            retry["result"]["agent"]["agent_session"],
-            serde_json::json!({
-                "source": "herdr:codex",
-                "agent": "codex",
-                "kind": "id",
-                "value": "codex-session",
-            })
+            app.state.terminals[&terminal_id]
+                .persisted_agent_session
+                .as_ref()
+                .unwrap()
+                .session_ref
+                .value,
+            "codex-session"
         );
         assert_eq!(
             app.state.terminals[&terminal_id].agent_name.as_deref(),

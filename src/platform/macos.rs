@@ -996,7 +996,7 @@ fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn process_argv(pid: u32) -> Option<Vec<String>> {
+pub(super) fn process_argv_for_authority(pid: u32) -> Option<Vec<String>> {
     let buf = kern_procargs2(pid)?;
     procargs2_argv(&buf)
 }

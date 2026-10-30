@@ -30,6 +30,47 @@ use super::super::api_helpers::{
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
+fn codex_process_can_own_pane_session(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let program = std::path::Path::new(program)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(program);
+    if program != "codex" && program != "codex.exe" {
+        return false;
+    }
+    let args = &argv[1..];
+    if args.iter().any(|arg| arg == "--managed-daemon") {
+        return false;
+    }
+    let Some(app_server) = args.iter().position(|arg| arg == "app-server") else {
+        // An interactive Codex process can still own its session when the hook
+        // is a descendant of this exact process. A shared daemon is reparented
+        // outside the pane and is rejected by the ancestry check.
+        return true;
+    };
+    let mut listen = None;
+    let mut index = app_server + 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => break,
+            "--stdio" => listen = Some("stdio://"),
+            "--listen" => {
+                listen = args.get(index + 1).map(String::as_str);
+                index += 1;
+            }
+            value if value.starts_with("--listen=") => {
+                listen = value.strip_prefix("--listen=");
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    listen.is_none_or(|value| value == "stdio://" || value == "stdio")
+}
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
@@ -1600,6 +1641,7 @@ impl App {
         &mut self,
         id: String,
         params: PaneReportAgentSessionParams,
+        peer_pid: Option<u32>,
     ) -> String {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
@@ -1610,27 +1652,129 @@ impl App {
         if let Err(message) = validate_optional_resume_argv(params.resume_argv.as_deref()) {
             return encode_error(id, "invalid_resume_argv", message);
         }
-        let report_is_newer = self
-            .pane_terminal(ws_idx, pane_id)
-            .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
-        let session_ref = crate::agent_resume::session_ref_from_report(
+        if !crate::agent_resume::is_official_agent_source(&params.source, &agent_label) {
+            return encode_error(
+                id,
+                "unauthorized_agent_session",
+                "unrecognized agent source",
+            );
+        }
+        let Some(session_ref) = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
             params.agent_session_id,
             params.agent_session_path,
-        );
-        self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
-            pane_id,
-            session_ref: session_ref.clone(),
-            source: params.source.clone(),
-            agent_label: agent_label.clone(),
-            seq: params.seq,
-            session_start_source: crate::agent_resume::normalize_session_start_source(
-                params.session_start_source,
-            ),
-        });
+        ) else {
+            return encode_error(
+                id,
+                "invalid_agent_session",
+                "invalid agent session reference",
+            );
+        };
+        let Some(peer_pid) = peer_pid else {
+            return encode_error(
+                id,
+                "unauthenticated_agent_session",
+                "agent session reports require an authenticated local process",
+            );
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(shell_pid) = runtime.child_pid() else {
+            return encode_error(
+                id,
+                "pane_process_unavailable",
+                "pane process is unavailable",
+            );
+        };
+        let Some(job) = crate::detect::foreground_job(shell_pid) else {
+            return encode_error(
+                id,
+                "no_foreground_agent",
+                "pane has no foreground agent process",
+            );
+        };
+        let Some((detected_agent, _, process_id)) =
+            crate::detect::identify_agent_process_in_job(&job)
+        else {
+            return encode_error(
+                id,
+                "no_foreground_agent",
+                "pane has no foreground agent process",
+            );
+        };
+        if crate::detect::agent_label(detected_agent) != agent_label {
+            return encode_error(
+                id,
+                "agent_session_owner_mismatch",
+                "declared agent does not own the pane",
+            );
+        }
+        if detected_agent == crate::detect::Agent::Codex {
+            let Some(process_argv) = crate::platform::process_argv(process_id) else {
+                return encode_error(
+                    id,
+                    "agent_session_owner_unavailable",
+                    "cannot inspect the pane's agent process",
+                );
+            };
+            if !codex_process_can_own_pane_session(&process_argv) {
+                return encode_error(
+                    id,
+                    "agent_session_owner_unsupported",
+                    "shared Codex daemons cannot own a pane session",
+                );
+            }
+        }
+        let Some(process_start_token) = crate::platform::process_start_token(process_id) else {
+            return encode_error(
+                id,
+                "agent_session_owner_unavailable",
+                "cannot verify the agent process lifetime",
+            );
+        };
+        if !crate::platform::process_is_descendant_of(peer_pid, process_id, process_start_token) {
+            return encode_error(
+                id,
+                "agent_session_peer_mismatch",
+                "reporting process does not belong to the pane's agent",
+            );
+        }
+        let report_is_newer = self
+            .pane_terminal(ws_idx, pane_id)
+            .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
+        let Some(terminal_id) = self.state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let applied_session = self
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .and_then(|terminal| {
+                terminal.set_process_agent_session_ref(
+                    params.source.clone(),
+                    agent_label.clone(),
+                    session_ref.clone(),
+                    params.seq,
+                    crate::agent_resume::normalize_session_start_source(
+                        params.session_start_source,
+                    ),
+                    process_id,
+                    process_start_token,
+                )
+            })
+            .is_some();
+        if applied_session {
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
+            self.emit_pane_updated(ws_idx, pane_id);
+        }
         let applied =
-            report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+            report_is_newer && self.session_report_applied(ws_idx, pane_id, Some(&session_ref));
         self.report_agent_resume(
             id,
             ws_idx,
@@ -2323,6 +2467,40 @@ fn validate_optional_resume_argv(argv: Option<&[String]>) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_argv_rejects_shared_daemons_and_non_stdio_app_servers() {
+        let argv = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        };
+        for accepted in [
+            argv(&["codex", "app-server"]),
+            argv(&["/opt/homebrew/bin/codex", "app-server"]),
+            argv(&["codex", "app-server", "--listen", "stdio://"]),
+            argv(&["codex", "app-server", "--listen=stdio://"]),
+            argv(&["codex", "app-server", "--listen", "stdio"]),
+            argv(&["codex"]),
+            argv(&["codex", "--no-daemon"]),
+        ] {
+            assert!(
+                codex_process_can_own_pane_session(&accepted),
+                "{accepted:?}"
+            );
+        }
+        for refused in [
+            argv(&[]),
+            argv(&["sh", "-c", "codex app-server"]),
+            argv(&["codex", "app-server", "--listen", "unix://"]),
+            argv(&["codex", "app-server", "--listen", "ws://127.0.0.1:9"]),
+            argv(&["codex", "app-server", "--managed-daemon", "--stdio"]),
+            argv(&["codex", "--managed-daemon"]),
+        ] {
+            assert!(!codex_process_can_own_pane_session(&refused), "{refused:?}");
+        }
+    }
     use crate::{
         api::schema::{ErrorResponse, SplitDirection, SuccessResponse},
         config::Config,
@@ -2424,6 +2602,75 @@ mod tests {
     fn metadata_error_code(response: &str) -> String {
         let response: ErrorResponse = serde_json::from_str(response).unwrap();
         response.error.code
+    }
+
+    fn session_report(pane_id: &str) -> PaneReportAgentSessionParams {
+        PaneReportAgentSessionParams {
+            pane_id: pane_id.into(),
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            seq: Some(1),
+            agent_session_id: Some("opaque-session".into()),
+            agent_session_path: None,
+            session_start_source: Some("startup".into()),
+            resume_argv: None,
+        }
+    }
+
+    #[test]
+    fn agent_session_report_refuses_forged_and_unauthenticated_reports() {
+        let (mut app, pane_id) = app_with_test_workspace();
+
+        let mut forged_source = session_report(&pane_id);
+        forged_source.source = "custom:codex".into();
+        assert_eq!(
+            metadata_error_code(&app.handle_pane_report_agent_session(
+                "forged-source".into(),
+                forged_source,
+                Some(std::process::id()),
+            )),
+            "unauthorized_agent_session"
+        );
+
+        let mut forged_agent = session_report(&pane_id);
+        forged_agent.agent = "pi".into();
+        assert_eq!(
+            metadata_error_code(&app.handle_pane_report_agent_session(
+                "forged-agent".into(),
+                forged_agent,
+                Some(std::process::id()),
+            )),
+            "unauthorized_agent_session"
+        );
+
+        let mut forged_value = session_report(&pane_id);
+        forged_value.agent_session_id = Some("bad\nvalue".into());
+        assert_eq!(
+            metadata_error_code(&app.handle_pane_report_agent_session(
+                "forged-value".into(),
+                forged_value,
+                Some(std::process::id()),
+            )),
+            "invalid_agent_session"
+        );
+
+        assert_eq!(
+            metadata_error_code(&app.handle_pane_report_agent_session(
+                "missing-peer".into(),
+                session_report(&pane_id),
+                None,
+            )),
+            "unauthenticated_agent_session"
+        );
+
+        assert_eq!(
+            metadata_error_code(&app.handle_pane_report_agent_session(
+                "wrong-pane".into(),
+                session_report("w99:p99"),
+                Some(std::process::id()),
+            )),
+            "pane_not_found"
+        );
     }
 
     #[tokio::test]

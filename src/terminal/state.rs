@@ -25,6 +25,17 @@ pub struct HookAuthority {
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// A session reference accepted only from the pane's live foreground agent
+/// process. The start token distinguishes a replacement from a recycled PID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessAgentSessionBinding {
+    pub source: String,
+    pub agent_label: String,
+    pub session_ref: crate::agent_resume::AgentSessionRef,
+    pub process_id: u32,
+    pub process_start_token: u64,
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HandoffAgentState {
@@ -137,6 +148,7 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    pub process_agent_session: Option<ProcessAgentSessionBinding>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
     pub terminal_title: Option<String>,
@@ -177,6 +189,7 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            process_agent_session: None,
             reported_resume: None,
             reported_resume_revision: 0,
             terminal_title: None,
@@ -557,6 +570,13 @@ impl TerminalState {
                     })
             {
                 self.persisted_agent_session = None;
+            }
+            if !newer_custom_authority
+                && self.process_agent_session.as_ref().is_some_and(|binding| {
+                    crate::detect::parse_agent_label(&binding.agent_label) == agent
+                })
+            {
+                self.process_agent_session = None;
             }
             if !newer_custom_authority
                 && agent.is_some()
@@ -1307,6 +1327,14 @@ impl TerminalState {
         crate::agent_resume::AgentSessionRefKind,
         String,
     )> {
+        if let Some(binding) = self.process_agent_session.as_ref() {
+            return Some((
+                binding.source.clone(),
+                binding.agent_label.clone(),
+                binding.session_ref.kind,
+                binding.session_ref.value.clone(),
+            ));
+        }
         if let Some(authority) = self.hook_authority.as_ref() {
             if let Some(session_ref) = authority.session_ref.as_ref() {
                 return Some((
@@ -1695,6 +1723,88 @@ impl TerminalState {
         })
     }
 
+    /// Accepts session identity only after the API layer has authenticated the
+    /// reporting process as the live foreground occupant of this pane.
+    pub fn set_process_agent_session_ref(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: crate::agent_resume::AgentSessionRef,
+        seq: Option<u64>,
+        session_start_source: Option<String>,
+        process_id: u32,
+        process_start_token: u64,
+    ) -> Option<TerminalStateMutation> {
+        let known_agent = crate::detect::parse_agent_label(&agent_label)?;
+        if self.detected_agent != Some(known_agent) || self.recent_agent_process_exit.is_some() {
+            return None;
+        }
+        if !self.accept_hook_report(&source, seq) {
+            return None;
+        }
+        if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
+            return None;
+        }
+        if !Self::session_report_allows_session_replacement(
+            &source,
+            &agent_label,
+            session_start_source.as_deref(),
+        ) {
+            return None;
+        }
+        if let Some(binding) = self.process_agent_session.as_ref() {
+            if binding.process_id == process_id
+                && binding.process_start_token == process_start_token
+            {
+                if binding.source == source
+                    && binding.agent_label == agent_label
+                    && binding.session_ref == session_ref
+                {
+                    return None;
+                }
+                // A live process may rotate identity only through an explicit,
+                // sequenced lifecycle report. An unsequenced duplicate cannot
+                // overwrite a concurrent winner.
+                if seq.is_none() {
+                    return None;
+                }
+            }
+        }
+        let now = Instant::now();
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        let previous_session = self.current_session_identity_for_persistence();
+        self.process_agent_session = Some(ProcessAgentSessionBinding {
+            source: source.clone(),
+            agent_label: agent_label.clone(),
+            session_ref: session_ref.clone(),
+            process_id,
+            process_start_token,
+        });
+        self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source,
+            agent: agent_label,
+            session_ref,
+        });
+        let current_session = self.current_session_identity_for_persistence();
+        if previous_session.is_some() && previous_session != current_session {
+            self.agent_process_acquisition_pending = true;
+        }
+        Some(TerminalStateMutation {
+            effective_state_change: self.recompute_effective_state(
+                previous_agent_label,
+                previous_known_agent,
+                previous_state,
+                previous_presentation,
+                now,
+            ),
+            session_ref_changed: previous_session != current_session,
+            agent_released: false,
+        })
+    }
+
     fn known_agent_label_conflicts_with_detected_agent(&self, agent_label: &str) -> bool {
         let Some(detected_agent) = self.detected_agent else {
             return false;
@@ -1795,6 +1905,7 @@ impl TerminalState {
             self.forget_reported_resume_of(&authority.source, &authority.agent_label);
         }
         self.persisted_agent_session = None;
+        self.process_agent_session = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1859,6 +1970,9 @@ impl TerminalState {
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
+        }
+        if !preserve_foreign_persisted_session {
+            self.process_agent_session = None;
         }
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
@@ -1926,6 +2040,21 @@ impl TerminalState {
             .is_some_and(|(_, _, kind, value)| {
                 kind == session_ref.kind && value == session_ref.value
             })
+    }
+
+    pub fn process_agent_session(&self) -> Option<&ProcessAgentSessionBinding> {
+        self.process_agent_session.as_ref()
+    }
+
+    /// PIDs are never reused while the original process start token still
+    /// matches, so this rejects an exited/restarted occupant even if a cached
+    /// snapshot survived the transition.
+    pub fn process_agent_session_process_is_live(
+        &self,
+        binding: &ProcessAgentSessionBinding,
+    ) -> bool {
+        crate::platform::process_start_token(binding.process_id)
+            == Some(binding.process_start_token)
     }
 
     /// A reporter may own the resume command when it holds the pane, or when it
@@ -2331,6 +2460,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.process_agent_session = None;
         self.agent_metadata.clear();
         self.metadata_report_agents.clear();
         self.suppressed_full_lifecycle_hook_reports.clear();
@@ -2456,6 +2586,209 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    fn codex_session(value: &str) -> crate::agent_resume::AgentSessionRef {
+        crate::agent_resume::AgentSessionRef::id(value).unwrap()
+    }
+
+    fn bind_test_codex_session(
+        terminal: &mut TerminalState,
+        value: &str,
+        seq: u64,
+        start: &str,
+        process_id: u32,
+        process_start_token: u64,
+    ) -> bool {
+        terminal
+            .set_process_agent_session_ref(
+                "herdr:codex".into(),
+                "codex".into(),
+                codex_session(value),
+                Some(seq),
+                Some(start.into()),
+                process_id,
+                process_start_token,
+            )
+            .is_some()
+    }
+
+    #[test]
+    fn process_agent_session_binds_live_foreground_codex() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+        let binding = terminal.process_agent_session().unwrap();
+        assert_eq!(binding.session_ref.value, "session-a");
+        assert_eq!(binding.process_id, 4100);
+        assert_eq!(binding.process_start_token, 9100);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| session.session_ref.value.as_str()),
+            Some("session-a")
+        );
+    }
+
+    #[test]
+    fn process_agent_session_rotation_requires_new_sequence_and_lifecycle_source() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+
+        assert!(!bind_test_codex_session(
+            &mut terminal,
+            "session-b",
+            10,
+            "clear",
+            4100,
+            9100,
+        ));
+        assert!(!bind_test_codex_session(
+            &mut terminal,
+            "session-b",
+            11,
+            "unknown",
+            4100,
+            9100,
+        ));
+        assert_eq!(
+            terminal.process_agent_session().unwrap().session_ref.value,
+            "session-a"
+        );
+
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-b",
+            12,
+            "clear",
+            4100,
+            9100,
+        ));
+        assert_eq!(
+            terminal.process_agent_session().unwrap().session_ref.value,
+            "session-b"
+        );
+    }
+
+    #[test]
+    fn duplicate_process_reports_cannot_transfer_identity() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+
+        assert!(!bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "resume",
+            4200,
+            9200,
+        ));
+        assert_eq!(terminal.process_agent_session().unwrap().process_id, 4100);
+    }
+
+    #[test]
+    fn process_exit_clears_and_delayed_old_report_cannot_resurrect() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            Instant::now(),
+        );
+        assert!(terminal.process_agent_session().is_none());
+
+        assert!(!bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+        assert!(terminal.process_agent_session().is_none());
+    }
+
+    #[test]
+    fn process_binding_requires_detected_codex_and_is_cleared_on_release() {
+        let mut terminal = test_terminal();
+        assert!(!bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+        terminal.release_agent_with_mutation("herdr:codex", "codex", Some(11));
+        assert!(terminal.process_agent_session().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_does_not_carry_process_session_binding() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+        let snapshot = terminal.handoff_agent_state();
+        assert!(
+            snapshot.is_none(),
+            "session-only hook authority must not hand off"
+        );
+        assert!(terminal.process_agent_session().is_some());
     }
 
     fn test_session_path(name: &str) -> String {

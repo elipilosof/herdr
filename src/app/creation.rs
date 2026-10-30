@@ -416,24 +416,16 @@ impl App {
 fn terminal_agent_session_info(
     terminal: &crate::terminal::TerminalState,
 ) -> Option<crate::api::schema::AgentSessionInfo> {
-    if let Some(authority) = terminal.hook_authority.as_ref() {
-        if let Some(session_ref) = authority.session_ref.as_ref() {
-            return Some(crate::api::schema::AgentSessionInfo {
-                source: authority.source.clone(),
-                agent: authority.agent_label.clone(),
-                kind: session_ref.kind,
-                value: session_ref.value.clone(),
-            });
-        }
-    }
-
     terminal
-        .persisted_agent_session
-        .as_ref()
-        .map(|session| crate::api::schema::AgentSessionInfo {
-            source: session.source.clone(),
-            agent: session.agent.clone(),
-            kind: session.session_ref.kind,
-            value: session.session_ref.value.clone(),
+        .process_agent_session()
+        .filter(|binding| {
+            terminal.detected_agent.is_some()
+                && terminal.process_agent_session_process_is_live(binding)
+        })
+        .map(|binding| crate::api::schema::AgentSessionInfo {
+            source: binding.source.clone(),
+            agent: binding.agent_label.clone(),
+            kind: binding.session_ref.kind,
+            value: binding.session_ref.value.clone(),
         })
 }

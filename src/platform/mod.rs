@@ -139,6 +139,25 @@ pub(crate) fn local_stream_peer_description(_stream: &crate::ipc::LocalStream) -
     None
 }
 
+#[cfg(not(unix))]
+pub(crate) fn local_stream_peer_pid(_stream: &crate::ipc::LocalStream) -> Option<u32> {
+    None
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_is_descendant_of(
+    _peer_pid: u32,
+    _ancestor_pid: u32,
+    _ancestor_start_token: u64,
+) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+pub(crate) fn process_argv(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -445,7 +464,8 @@ pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, ignore_server_hangup,
-    local_stream_peer_description, spawn_server_signal_monitor, RemoteBridgeWake,
+    local_stream_peer_description, local_stream_peer_pid, process_argv, process_is_descendant_of,
+    spawn_server_signal_monitor, RemoteBridgeWake,
 };
 
 mod client_state;
@@ -776,6 +796,43 @@ mod tests {
         assert_eq!(live_pane_process_group(shell_pid, agent_pid, token), None);
         let _ = wrapper.kill();
         let _ = wrapper.wait();
+    }
+
+    #[test]
+    fn process_descendant_check_requires_the_recorded_start_token() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn child");
+        let child_pid = child.id();
+        let parent_pid = std::process::id();
+        let parent_token = process_start_token(parent_pid).expect("parent start token");
+        let child_token = process_start_token(child_pid).expect("child start token");
+
+        assert!(process_is_descendant_of(
+            parent_pid,
+            parent_pid,
+            parent_token
+        ));
+        assert!(process_is_descendant_of(
+            child_pid,
+            parent_pid,
+            parent_token
+        ));
+        assert!(!process_is_descendant_of(
+            child_pid,
+            parent_pid,
+            parent_token.saturating_add(1),
+        ));
+        assert!(!process_is_descendant_of(
+            child_pid,
+            child_pid,
+            child_token + 1
+        ));
+        assert!(!process_is_descendant_of(0, parent_pid, parent_token));
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

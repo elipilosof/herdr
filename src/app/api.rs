@@ -933,6 +933,14 @@ impl App {
         &mut self,
         request: crate::api::schema::Request,
     ) -> String {
+        self.handle_api_request_with_peer(request, None)
+    }
+
+    pub(crate) fn handle_api_request_with_peer(
+        &mut self,
+        request: crate::api::schema::Request,
+        peer_pid: Option<u32>,
+    ) -> String {
         self.sync_pending_terminal_titles();
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
@@ -1190,7 +1198,7 @@ impl App {
                 return self.handle_pane_report_agent(request.id, params);
             }
             Method::PaneReportAgentSession(params) => {
-                return self.handle_pane_report_agent_session(request.id, params);
+                return self.handle_pane_report_agent_session(request.id, params, peer_pid);
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);

@@ -84,6 +84,8 @@ pub struct ApiRequestMessage {
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    /// Kernel-authenticated local socket peer, never supplied by the request body.
+    pub peer_pid: Option<u32>,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

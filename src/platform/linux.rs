@@ -361,7 +361,7 @@ fn foreground_job_for_group(child_pid: u32, process_group_id: u32) -> Option<For
         process_group_id,
         members,
         running_inside_wsl(),
-        process_argv,
+        process_argv_for_authority,
     )
 }
 
@@ -634,7 +634,7 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
     }
 
     let argv = process_allows_remote_memory_read(state, &name, running_inside_wsl())
-        .then(|| process_argv(process_group_id))
+        .then(|| process_argv_for_authority(process_group_id))
         .flatten();
     Some(ForegroundJob {
         process_group_id,
@@ -760,7 +760,7 @@ fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl
         && (!running_inside_wsl || crate::detect::identify_agent(comm).is_none())
 }
 
-fn process_argv(pid: u32) -> Option<Vec<String>> {
+pub(super) fn process_argv_for_authority(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {
         return None;

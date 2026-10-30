@@ -335,6 +335,58 @@ pub(crate) fn local_stream_peer_description(stream: &crate::ipc::LocalStream) ->
     Some(description)
 }
 
+/// The kernel-authenticated process on the other end of a local socket.
+pub(crate) fn local_stream_peer_pid(stream: &crate::ipc::LocalStream) -> Option<u32> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let crate::ipc::LocalStream::UdSocket(socket) = stream;
+    super::socket_peer_pid(socket.as_fd().as_raw_fd())
+}
+
+/// Whether `peer_pid` is the same live process as, or a descendant of, the
+/// process identified by `ancestor_pid` and `ancestor_start_token`.
+///
+/// Every hop is matched to its process start token, so a recycled pid cannot
+/// inherit the authority of a process that already exited.
+pub(crate) fn process_is_descendant_of(
+    peer_pid: u32,
+    ancestor_pid: u32,
+    ancestor_start_token: u64,
+) -> bool {
+    if peer_pid == 0 || ancestor_pid == 0 {
+        return false;
+    }
+
+    let mut current = peer_pid;
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..64 {
+        if !visited.insert(current) {
+            return false;
+        }
+        let Some(current_token) = super::process_start_token(current) else {
+            return false;
+        };
+        if current == ancestor_pid {
+            return current_token == ancestor_start_token;
+        }
+        let Some((_, parent)) = super::process_name_and_parent(current) else {
+            return false;
+        };
+        if parent <= 1 || parent == current {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// The live process argv used to distinguish a pane-local Codex app-server
+/// from a shared managed daemon. The start token is checked by the caller so a
+/// recycled PID cannot supply stale arguments.
+pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
+    super::process_argv_for_authority(pid)
+}
+
 pub(crate) fn begin_cli_output() {
     set_sigpipe_disposition(libc::SIG_DFL);
 }
