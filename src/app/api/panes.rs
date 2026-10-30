@@ -71,6 +71,77 @@ fn codex_process_can_own_pane_session(argv: &[String]) -> bool {
     listen.is_none_or(|value| value == "stdio://" || value == "stdio")
 }
 
+fn codex_hook_argv_is_session_hook(argv: &[String], hook_path: &std::path::Path) -> bool {
+    argv.len() == 3
+        && argv[0] == "bash"
+        && argv[1] == hook_path.display().to_string()
+        && argv[2] == "session"
+}
+
+fn codex_python_helper_argv(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let program = std::path::Path::new(program)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(program);
+    argv.len() == 2 && matches!(program, "python3" | "python") && argv[1] == "-"
+}
+
+fn codex_hook_process_proves_pane_owner(
+    hook_pid: u32,
+    agent_pid: u32,
+    pane_id: &str,
+    socket_path: &str,
+) -> bool {
+    let Some(parent) = crate::platform::process_parent_pid(hook_pid) else {
+        return false;
+    };
+    if parent != agent_pid {
+        return false;
+    }
+    let Some(argv) = crate::platform::process_argv(hook_pid) else {
+        return false;
+    };
+    let Some(hook_path) = crate::integration::codex_hook_path() else {
+        return false;
+    };
+    if !codex_hook_argv_is_session_hook(&argv, &hook_path) {
+        return false;
+    }
+    crate::platform::process_has_variable(hook_pid, crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE)
+        && crate::platform::process_has_variable(
+            hook_pid,
+            crate::integration::HERDR_PANE_ID_ENV_VAR,
+            pane_id,
+        )
+        && crate::platform::process_has_variable(
+            hook_pid,
+            crate::api::SOCKET_PATH_ENV_VAR,
+            socket_path,
+        )
+}
+
+fn codex_hook_peer_proves_pane_owner(
+    peer_pid: u32,
+    agent_pid: u32,
+    pane_id: &str,
+    socket_path: &str,
+) -> bool {
+    if codex_hook_process_proves_pane_owner(peer_pid, agent_pid, pane_id, socket_path) {
+        return true;
+    }
+    let Some(parent) = crate::platform::process_parent_pid(peer_pid) else {
+        return false;
+    };
+    let Some(argv) = crate::platform::process_argv(peer_pid) else {
+        return false;
+    };
+    codex_python_helper_argv(&argv)
+        && codex_hook_process_proves_pane_owner(parent, agent_pid, pane_id, socket_path)
+}
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
@@ -1750,6 +1821,27 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
+        if detected_agent == crate::detect::Agent::Codex
+            && !codex_hook_peer_proves_pane_owner(
+                peer_pid,
+                process_id,
+                &params.pane_id,
+                &crate::api::socket_path().display().to_string(),
+            )
+        {
+            return encode_error(
+                id,
+                "agent_session_peer_mismatch",
+                "reporting process is not the installed Codex session hook",
+            );
+        }
+        if crate::platform::process_start_token(process_id) != Some(process_start_token) {
+            return encode_error(
+                id,
+                "agent_session_owner_changed",
+                "pane agent process changed while authenticating the report",
+            );
+        }
         let applied_session = self
             .state
             .terminals
@@ -2500,6 +2592,47 @@ mod tests {
         ] {
             assert!(!codex_process_can_own_pane_session(&refused), "{refused:?}");
         }
+    }
+
+    #[test]
+    fn codex_hook_peer_requires_installed_hook_shape() {
+        let hook_path = std::path::Path::new("/Users/test/.codex/herdr-agent-state.sh");
+        assert!(codex_hook_argv_is_session_hook(
+            &[
+                "bash".into(),
+                hook_path.display().to_string(),
+                "session".into()
+            ],
+            hook_path,
+        ));
+        for argv in [
+            vec!["bash", "/tmp/other.sh", "session"],
+            vec!["sh", "/Users/test/.codex/herdr-agent-state.sh", "session"],
+            vec!["bash", "/Users/test/.codex/herdr-agent-state.sh", "idle"],
+            vec![
+                "bash",
+                "/Users/test/.codex/herdr-agent-state.sh",
+                "session",
+                "extra",
+            ],
+        ] {
+            let argv = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                !codex_hook_argv_is_session_hook(&argv, hook_path),
+                "{argv:?}"
+            );
+        }
+        assert!(codex_python_helper_argv(&["python3".into(), "-".into()]));
+        assert!(codex_python_helper_argv(&[
+            "/usr/bin/python".into(),
+            "-".into()
+        ]));
+        assert!(!codex_python_helper_argv(&["node".into(), "-".into()]));
+        assert!(!codex_python_helper_argv(&[
+            "python3".into(),
+            "-c".into(),
+            "print(1)".into()
+        ]));
     }
     use crate::{
         api::schema::{ErrorResponse, SplitDirection, SuccessResponse},

@@ -158,6 +158,11 @@ pub(crate) fn process_argv(_pid: u32) -> Option<Vec<String>> {
     None
 }
 
+#[cfg(not(unix))]
+pub(crate) fn process_parent_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
@@ -464,8 +469,8 @@ pub(crate) mod unix_image_files;
 #[cfg(unix)]
 pub(crate) use unix_common::{
     begin_cli_output, end_cli_output, forward_remote_bridge_stdio, ignore_server_hangup,
-    local_stream_peer_description, local_stream_peer_pid, process_argv, process_is_descendant_of,
-    spawn_server_signal_monitor, RemoteBridgeWake,
+    local_stream_peer_description, local_stream_peer_pid, process_argv, process_has_variable,
+    process_is_descendant_of, process_parent_pid, spawn_server_signal_monitor, RemoteBridgeWake,
 };
 
 mod client_state;

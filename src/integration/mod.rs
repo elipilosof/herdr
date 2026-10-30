@@ -17,8 +17,15 @@ pub(crate) use actions::{
 #[cfg(test)]
 pub(crate) use env::integration_env_lock;
 pub(crate) use env::{
-    apply_pane_base_env, HERDR_PANE_ID_ENV_VAR, HERDR_TAB_ID_ENV_VAR, HERDR_WORKSPACE_ID_ENV_VAR,
+    apply_pane_base_env, codex_dir, HERDR_PANE_ID_ENV_VAR, HERDR_TAB_ID_ENV_VAR,
+    HERDR_WORKSPACE_ID_ENV_VAR,
 };
+
+pub(crate) fn codex_hook_path() -> Option<std::path::PathBuf> {
+    codex_dir()
+        .ok()
+        .map(|dir| dir.join(CODEX_HOOK_INSTALL_NAME))
+}
 pub(crate) use registry::{
     experimental_letta_integration_status, installed_integration_statuses,
     integration_recommendations, integration_target_label, print_outdated_update_notice,

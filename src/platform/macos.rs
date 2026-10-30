@@ -1001,6 +1001,15 @@ pub(super) fn process_argv_for_authority(pid: u32) -> Option<Vec<String>> {
     procargs2_argv(&buf)
 }
 
+pub(super) fn process_environment_variable(pid: u32, name: &str) -> Option<String> {
+    let buf = kern_procargs2(pid)?;
+    let prefix = format!("{name}=");
+    procargs2_env(&buf)?
+        .split(|&byte| byte == 0)
+        .find_map(|record| record.strip_prefix(prefix.as_bytes()))
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+}
+
 /// Read a Herdr agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {

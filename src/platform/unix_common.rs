@@ -387,6 +387,15 @@ pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
     super::process_argv_for_authority(pid)
 }
 
+/// Whether the live process environment contains `name=value`.
+pub(crate) fn process_has_variable(pid: u32, name: &str, value: &str) -> bool {
+    super::process_environment_variable(pid, name).as_deref() == Some(value)
+}
+
+pub(crate) fn process_parent_pid(pid: u32) -> Option<u32> {
+    super::process_name_and_parent(pid).map(|(_, parent)| parent)
+}
+
 pub(crate) fn begin_cli_output() {
     set_sigpipe_disposition(libc::SIG_DFL);
 }
