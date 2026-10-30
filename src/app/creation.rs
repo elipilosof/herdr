@@ -419,8 +419,9 @@ fn terminal_agent_session_info(
     terminal
         .process_agent_session()
         .filter(|binding| {
-            terminal.detected_agent.is_some()
-                && terminal.process_agent_session_process_is_live(binding)
+            terminal.detected_agent.is_some_and(|agent| {
+                crate::detect::parse_agent_label(&binding.agent_label) == Some(agent)
+            }) && terminal.process_agent_session_process_is_live(binding)
         })
         .map(|binding| crate::api::schema::AgentSessionInfo {
             source: binding.source.clone(),

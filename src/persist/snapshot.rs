@@ -351,25 +351,15 @@ fn capture_tab(
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         let agent_session = terminal.and_then(|terminal| {
-            if let Some(authority) = terminal.hook_authority.as_ref() {
-                if let Some(session_ref) = authority.session_ref.as_ref() {
-                    return Some(PaneAgentSessionSnapshot {
-                        source: authority.source.clone(),
-                        agent: authority.agent_label.clone(),
-                        kind: session_ref.kind,
-                        value: session_ref.value.clone(),
-                    });
-                }
+            if let Some(identity) = terminal.current_session_identity_for_persistence() {
+                return Some(PaneAgentSessionSnapshot {
+                    source: identity.0,
+                    agent: identity.1,
+                    kind: identity.2,
+                    value: identity.3,
+                });
             }
-            terminal
-                .persisted_agent_session
-                .as_ref()
-                .map(|session| PaneAgentSessionSnapshot {
-                    source: session.source.clone(),
-                    agent: session.agent.clone(),
-                    kind: session.session_ref.kind,
-                    value: session.session_ref.value.clone(),
-                })
+            None
         });
         let agent_resume = terminal
             .and_then(|terminal| terminal.reported_resume())
@@ -1303,6 +1293,33 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Path
         );
         assert_eq!(agent_session.value, session_path);
+    }
+
+    #[test]
+    fn capture_contract_omits_dead_process_bound_agent_session() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Codex),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.process_agent_session = Some(crate::terminal::state::ProcessAgentSessionBinding {
+            source: "herdr:codex".into(),
+            agent_label: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("dead-session").unwrap(),
+            process_id: u32::MAX,
+            process_start_token: 1,
+        });
+
+        let snapshot = capture_from_state(&state);
+        assert!(snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .is_none());
     }
 
     #[test]

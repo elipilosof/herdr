@@ -72,9 +72,15 @@ fn codex_process_can_own_pane_session(argv: &[String]) -> bool {
 }
 
 fn codex_hook_argv_is_session_hook(argv: &[String], hook_path: &std::path::Path) -> bool {
+    let normalized_hook_path = hook_path
+        .canonicalize()
+        .unwrap_or_else(|_| hook_path.to_path_buf());
     argv.len() == 3
         && argv[0] == "bash"
-        && argv[1] == hook_path.display().to_string()
+        && std::path::Path::new(&argv[1])
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&argv[1]))
+            == normalized_hook_path
         && argv[2] == "session"
 }
 
@@ -1857,6 +1863,16 @@ impl App {
                     ),
                     process_id,
                     process_start_token,
+                    |pid, start_token| {
+                        crate::platform::process_start_token(pid) == Some(start_token)
+                            && crate::detect::foreground_job(shell_pid).is_some_and(|job| {
+                                crate::detect::identify_agent_process_in_job(&job).is_some_and(
+                                    |(agent, _, owner_pid)| {
+                                        agent == detected_agent && owner_pid == pid
+                                    },
+                                )
+                            })
+                    },
                 )
             })
             .is_some();

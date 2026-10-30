@@ -247,10 +247,16 @@ impl TerminalState {
         if !self.live_full_lifecycle_hook_authority() {
             return None;
         }
-        let authority = self.hook_authority.as_ref()?;
+        let mut authority = self.hook_authority.as_ref()?.clone();
+        // Process-bound identity belongs to the live pane occupant and must be
+        // re-established by that process after handoff, never transferred.
+        if self.process_agent_session.is_some() {
+            authority.session_ref = None;
+        }
+        let sequence = self.hook_report_sequences.get(&authority.source).copied();
         Some(HandoffAgentState {
-            authority: authority.clone(),
-            sequence: self.hook_report_sequences.get(&authority.source).copied(),
+            authority,
+            sequence,
             acquisition_pending: self.agent_process_acquisition_pending,
         })
     }
@@ -265,6 +271,7 @@ impl TerminalState {
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
+        self.process_agent_session = None;
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
@@ -1319,7 +1326,7 @@ impl TerminalState {
             })
     }
 
-    fn current_session_identity_for_persistence(
+    pub(crate) fn current_session_identity_for_persistence(
         &self,
     ) -> Option<(
         String,
@@ -1328,12 +1335,18 @@ impl TerminalState {
         String,
     )> {
         if let Some(binding) = self.process_agent_session.as_ref() {
-            return Some((
-                binding.source.clone(),
-                binding.agent_label.clone(),
-                binding.session_ref.kind,
-                binding.session_ref.value.clone(),
-            ));
+            // A process-bound session is current only while that exact process
+            // incarnation is alive. Do not fall through to a cached identity.
+            return self
+                .process_agent_session_process_is_live(binding)
+                .then(|| {
+                    (
+                        binding.source.clone(),
+                        binding.agent_label.clone(),
+                        binding.session_ref.kind,
+                        binding.session_ref.value.clone(),
+                    )
+                });
         }
         if let Some(authority) = self.hook_authority.as_ref() {
             if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -1734,6 +1747,7 @@ impl TerminalState {
         session_start_source: Option<String>,
         process_id: u32,
         process_start_token: u64,
+        owner_is_live: impl FnOnce(u32, u64) -> bool,
     ) -> Option<TerminalStateMutation> {
         let known_agent = crate::detect::parse_agent_label(&agent_label)?;
         if self.detected_agent != Some(known_agent) || self.recent_agent_process_exit.is_some() {
@@ -1769,6 +1783,9 @@ impl TerminalState {
                     return None;
                 }
             }
+        }
+        if !owner_is_live(process_id, process_start_token) {
+            return None;
         }
         let now = Instant::now();
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
@@ -2609,6 +2626,7 @@ mod tests {
                 Some(start.into()),
                 process_id,
                 process_start_token,
+                |_, _| true,
             )
             .is_some()
     }
@@ -2684,6 +2702,38 @@ mod tests {
         assert_eq!(
             terminal.process_agent_session().unwrap().session_ref.value,
             "session-b"
+        );
+    }
+
+    #[test]
+    fn process_binding_rechecks_live_pane_owner_at_bind_time() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        assert!(bind_test_codex_session(
+            &mut terminal,
+            "session-a",
+            10,
+            "startup",
+            4100,
+            9100,
+        ));
+
+        let rejected = terminal
+            .set_process_agent_session_ref(
+                "herdr:codex".into(),
+                "codex".into(),
+                codex_session("session-b"),
+                Some(11),
+                Some("clear".into()),
+                4200,
+                9200,
+                |_, _| false,
+            )
+            .is_none();
+        assert!(rejected);
+        assert_eq!(
+            terminal.process_agent_session().unwrap().session_ref.value,
+            "session-a"
         );
     }
 
@@ -2789,6 +2839,41 @@ mod tests {
             "session-only hook authority must not hand off"
         );
         assert!(terminal.process_agent_session().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_strips_process_bound_session_identity_and_restore_clears_binding() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Working);
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("handoff-process.jsonl"))
+                .unwrap();
+        assert!(terminal
+            .set_process_agent_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                session_ref.clone(),
+                Some(10),
+                Some("startup".into()),
+                4100,
+                9100,
+                |_, _| true,
+            )
+            .is_some());
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Working,
+            None,
+            Some(session_ref),
+            Some(11),
+        );
+
+        let snapshot = terminal.handoff_agent_state().expect("handoff authority");
+        assert!(snapshot.authority.session_ref.is_none());
+        terminal.restore_handoff_agent_state(snapshot);
+        assert!(terminal.process_agent_session.is_none());
     }
 
     fn test_session_path(name: &str) -> String {
