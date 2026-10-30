@@ -148,6 +148,13 @@ fn codex_hook_peer_proves_pane_owner(
         && codex_hook_process_proves_pane_owner(parent, agent_pid, pane_id, socket_path)
 }
 
+fn codex_process_thread_id(agent_pid: u32, session_ref: &crate::agent_resume::AgentSessionRef) -> bool {
+    matches!(
+        session_ref.kind,
+        crate::agent_resume::AgentSessionRefKind::Id
+    ) && crate::platform::process_has_variable(agent_pid, "CODEX_THREAD_ID", &session_ref.value)
+}
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
@@ -1828,17 +1835,17 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         if detected_agent == crate::detect::Agent::Codex
-            && !codex_hook_peer_proves_pane_owner(
-                peer_pid,
-                process_id,
-                &params.pane_id,
-                &crate::api::socket_path().display().to_string(),
-            )
+            && (!codex_hook_peer_proves_pane_owner(
+                    peer_pid,
+                    process_id,
+                    &params.pane_id,
+                    &crate::api::socket_path().display().to_string(),
+                ) || !codex_process_thread_id(process_id, &session_ref))
         {
             return encode_error(
                 id,
                 "agent_session_peer_mismatch",
-                "reporting process is not the installed Codex session hook",
+                "report does not match the live Codex process and installed session hook",
             );
         }
         if crate::platform::process_start_token(process_id) != Some(process_start_token) {
@@ -2649,6 +2656,22 @@ mod tests {
             "-c".into(),
             "print(1)".into()
         ]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_session_must_match_live_agent_thread_id() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .env("CODEX_THREAD_ID", "live-thread")
+            .spawn()
+            .expect("spawn test process");
+        let live = crate::agent_resume::AgentSessionRef::id("live-thread").unwrap();
+        let forged = crate::agent_resume::AgentSessionRef::id("forged-thread").unwrap();
+        assert!(codex_process_thread_id(child.id(), &live));
+        assert!(!codex_process_thread_id(child.id(), &forged));
+        let _ = child.kill();
+        let _ = child.wait();
     }
     use crate::{
         api::schema::{ErrorResponse, SplitDirection, SuccessResponse},

@@ -163,6 +163,11 @@ pub(crate) fn process_parent_pid(_pid: u32) -> Option<u32> {
     None
 }
 
+#[cfg(not(unix))]
+pub(crate) fn process_has_variable(_pid: u32, _name: &str, _value: &str) -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
